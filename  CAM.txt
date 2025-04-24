@@ -1,0 +1,183 @@
+import cv2
+import numpy as np
+import math
+import time
+
+def calculate_centroid(contour):
+    """Calculates the center (centroid) of a contour."""
+    M = cv2.moments(contour)
+    if M["m00"] == 0:
+        return None
+    cx = int(M["m10"] / M["m00"])
+    cy = int(M["m01"] / M["m00"])
+    return (cx, cy)
+
+def dist_sq(p1, p2):
+    """Calculates the squared distance between two points."""
+    if p1 is None or p2 is None:
+        return float('inf')
+    return (p1[0] - p2[0])**2 + (p1[1] - p2[1])**2
+
+VIDEO_SOURCE = 0
+MIN_AREA = 400
+MAX_DISTANCE_SQ = 200**2
+OBJECT_TIMEOUT = 1.5
+
+LINE_POSITION_PERCENT = 0.5 
+HYSTERESIS_PERCENT = 0.05
+
+# --- Setup ---
+cap = cv2.VideoCapture(VIDEO_SOURCE)
+if not cap.isOpened():
+    print(f"Error: Could not open video source {VIDEO_SOURCE}")
+    exit()
+
+fgbg = cv2.createBackgroundSubtractorMOG2(history=500, varThreshold=50, detectShadows=False)
+
+people_inside_count = 0
+tracked_objects = {}
+next_object_id = 0
+
+frame_count = 0
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        print("End of video or error reading frame.")
+        break
+
+    frame_count += 1
+    h, w = frame.shape[:2]
+    line_x = int(w * LINE_POSITION_PERCENT)
+    hysteresis_margin = w * HYSTERESIS_PERCENT
+    line_plus_hysteresis = line_x + hysteresis_margin
+    line_minus_hysteresis = line_x - hysteresis_margin
+
+    current_time = time.time()
+    fgmask = fgbg.apply(frame)
+    _, thresh_mask = cv2.threshold(fgmask, 240, 255, cv2.THRESH_BINARY)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    closed_mask = cv2.morphologyEx(thresh_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    opened_mask = cv2.morphologyEx(closed_mask, cv2.MORPH_OPEN, kernel, iterations=1)
+    dilated_mask = cv2.dilate(opened_mask, kernel, iterations=2) 
+    contours, _ = cv2.findContours(dilated_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    current_detections = []
+    for c in contours:
+        area = cv2.contourArea(c)
+        if area > MIN_AREA:
+            centroid = calculate_centroid(c)
+            if centroid:
+                x, y, wb, hb = cv2.boundingRect(c)
+                current_detections.append({
+                    'centroid': centroid,
+                    'contour': c,
+                    'bbox': (x, y, wb, hb)
+                })
+
+    unmatched_detections = list(range(len(current_detections)))
+    matched_track_ids = set()
+    next_tracked_objects = {}
+
+    for track_id, data in tracked_objects.items():
+        best_match_idx = -1
+        min_dist = MAX_DISTANCE_SQ
+        
+        for i in unmatched_detections:
+            dist = dist_sq(data['centroid'], current_detections[i]['centroid'])
+            if dist < min_dist:
+                min_dist = dist
+                best_match_idx = i
+
+        if best_match_idx != -1:
+            matched_track_ids.add(track_id)
+            detection_data = current_detections[best_match_idx]
+            unmatched_detections.remove(best_match_idx) 
+
+            prev_centroid = data['centroid']
+            prev_side = data['side']
+            counted_flag_this_crossing = data['counted_crossing']
+
+            current_centroid = detection_data['centroid']
+            current_bbox = detection_data['bbox']
+            current_side = 'right' if current_centroid[0] >= line_x else 'left'
+
+            crossed_line_this_frame = False
+            if prev_side is not None and prev_side != current_side and not counted_flag_this_crossing:
+                if prev_side == 'left' and current_side == 'right':
+                    people_inside_count += 1
+                    counted_flag_this_crossing = True
+                    crossed_line_this_frame = True
+                    print(f"Frame {frame_count}: Object {track_id} Entered. Count: {people_inside_count}")
+                elif prev_side == 'right' and current_side == 'left':
+                    people_inside_count -= 1
+                    counted_flag_this_crossing = True
+                    crossed_line_this_frame = True
+                    print(f"Frame {frame_count}: Object {track_id} Exited. Count: {people_inside_count}")
+
+            if counted_flag_this_crossing and not crossed_line_this_frame:
+                if current_side == 'right' and current_centroid[0] > line_plus_hysteresis:
+                    counted_flag_this_crossing = False
+                elif current_side == 'left' and current_centroid[0] < line_minus_hysteresis:
+                    counted_flag_this_crossing = False
+
+            next_tracked_objects[track_id] = {
+                'centroid': current_centroid,
+                'side': current_side,
+                'counted_crossing': counted_flag_this_crossing,
+                'last_seen': current_time,
+                'bbox': current_bbox
+            }
+
+    for i in unmatched_detections:
+        detection_data = current_detections[i]
+        centroid = detection_data['centroid']
+        bbox = detection_data['bbox']
+        side = 'right' if centroid[0] >= line_x else 'left'
+
+        new_id = next_object_id
+        next_tracked_objects[new_id] = {
+            'centroid': centroid,
+            'side': side,
+            'counted_crossing': False,
+            'last_seen': current_time,
+            'bbox': bbox
+        }
+        next_object_id += 1
+        print(f"Frame {frame_count}: New object {new_id} detected on {side} side.")
+    final_tracked_objects = {}
+
+    for track_id, data in next_tracked_objects.items():
+        if current_time - data['last_seen'] <= OBJECT_TIMEOUT:
+            final_tracked_objects[track_id] = data
+        else:
+            print(f"Frame {frame_count}: Object {track_id} timed out.")
+    tracked_objects = final_tracked_objects 
+    cv2.line(frame, (line_x, 0), (line_x, h), (255, 0, 0), 2)
+    cv2.line(frame, (int(line_minus_hysteresis), 0), (int(line_minus_hysteresis), h), (0, 165, 255), 1)
+    cv2.line(frame, (int(line_plus_hysteresis), 0), (int(line_plus_hysteresis), h), (0, 165, 255), 1)
+
+    for track_id, data in tracked_objects.items():
+        x, y, current_w, current_h = data['bbox']
+        cx, cy = data['centroid']
+        side = data['side']
+        counted = data['counted_crossing']
+        color = (255, 255, 0) if side == 'left' else (0, 255, 255)
+        cv2.rectangle(frame, (x, y), (x + current_w, y + current_h), color, 2)
+        label = f"ID:{track_id}"
+        cv2.putText(frame, label, (x, y - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+        cv2.circle(frame, (cx, cy), 5, color, -1)
+        if counted:
+             cv2.circle(frame, (cx + 15, cy - 15), 7, (0, 0, 255), -1)
+
+    cv2.putText(frame, f"People Inside: {people_inside_count}", (10, 50),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 255), 3)
+    cv2.putText(frame, f"Tracked Objects: {len(tracked_objects)}", (10, 100),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
+    cv2.imshow("OpenCV People Counter", frame)
+    if cv2.waitKey(30) & 0xFF == 27:
+        break
+cap.release()
+cv2.destroyAllWindows()
+print(f"Final count: {people_inside_count}")
